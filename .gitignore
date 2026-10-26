@@ -1,0 +1,14 @@
+# 忽略所有无后缀的编译输出（Linux 下 nvcc 生成的可执行文件通常无后缀）
+*
+!*/
+!*.cu
+!*.cuh
+!*.h
+!*.hpp
+!*.cpp
+!*.c
+!*.md
+!*.txt
+!.gitignore
+!Makefile
+!CMakeLists.txt
