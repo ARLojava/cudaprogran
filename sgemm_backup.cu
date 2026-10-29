@@ -2,6 +2,21 @@
 #include <cublas_v2.h>
 #include <vector>
 
+
+#define BK 8
+#define BN 64
+#define BM 64
+#define TM 8
+#define TN 8
+#define BM5 128
+#define BN5 128
+#define BK5 8
+#define TM5 8
+#define TN5 8
+#define NT5 (BM5 * BN5 / (TM5 * TN5))     // 每块线程数 = 256
+static_assert(NT5 % BK5 == 0 && NT5 % BN5 == 0, "搬运时每趟要正好搬完整的行");
+static_assert(BK == BN / TM && BK == BM / TM, "K4 要求每个线程正好搬 As、Bs 各一格");
+
 #define CUBLAS_CHECK(call) do {                                         \
     cublasStatus_t st = (call);                                         \
     if (st != CUBLAS_STATUS_SUCCESS) {                                  \
@@ -49,6 +64,85 @@ __global__ void sgemm_smem(const float* A, const float* B, float* C, int N)
 }
 
 // 以后每写一个新版本，就在这里加一个 kernel，再在 main 里加一行 run(...)
+__global__ void sgemm_1D_tileing(const float* A, const float* B, float * C, int N)
+{
+    int tid = threadIdx.x;
+    int threadRow = tid / BN;
+    int threadCol = tid % BN;
+    __shared__ float As[BM][BK];  // 肥
+    __shared__ float Bs[BK][BN];  // 高
+    float acc[TM] = {0.0f};
+
+    for (unsigned int bk = 0; bk < N; bk += BK) {
+        As[tid / BK][tid % BK] = A[(blockIdx.y * BM + tid / BK) * N + bk + tid % BK];
+        Bs[tid / BN][tid % BN] = B[(bk + tid / BN) * N + blockIdx.x * BN + tid % BN];
+        __syncthreads();
+        for (unsigned int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            float btemp = Bs[dotIdx][threadCol];
+            for (unsigned int resIdx = 0; resIdx < TM; ++resIdx) {
+                acc[resIdx] += As[threadRow * TM + resIdx][dotIdx] * btemp;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int index = 0; index < TM; ++index) {
+        C[(blockIdx.y * BM + threadRow * TM + index) * N + blockIdx.x * BN + threadCol] = acc[index];
+    }
+}
+
+__global__ void sgemm_2D_tileing(const float* A, const float* B, float* C, int N)
+{
+    int tid = threadIdx.x;
+    int threadRow = tid / (BN / TN);
+    int threadCol = tid % (BN / TN);
+    float acc[TM][TN] = {0.0f};
+    __shared__ float As[BM][BK];  // 肥
+    __shared__ float Bs[BK][BN];  // 高
+
+    unsigned int strideA = blockDim.x / BK;
+    unsigned int strideB = blockDim.x / BN;
+    // 1,搬运至As中
+    for (unsigned int bk = 0; bk < N; bk += BK) {
+        for (unsigned int offset = 0; offset < BM; offset += strideA) {
+            As[tid / BK + offset][tid % BK] = A[(blockIdx.y * BM + tid / BK + offset) * N + tid % BK + bk];
+        }
+
+        for (unsigned int offset = 0; offset < BK; offset += strideB) {
+            Bs[tid / BN + offset][tid % BN] = B[(tid / BN + bk + offset) * N + blockIdx.x * BN + tid % BN];
+        }
+        __syncthreads();
+
+        //2.在dotIdx的前提下，取一列As与一行Bs放入寄存器中进行计算
+        for (unsigned int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+            float regM[TM], regN[TN];
+            for (unsigned int num = 0; num < TM; ++num) {
+                // 为什么要乘TM ?
+                regM[num] = As[threadRow * TM + num][dotIdx];
+            }
+
+            for (unsigned int num = 0; num < TN; ++num) {
+                // 为什么要乘TN ?
+                regN[num] = Bs[dotIdx][threadCol * TN + num];
+            }
+
+            for (unsigned int i = 0; i < TM; ++i) {
+                for (unsigned int j = 0; j < TN; ++j) {
+                    acc[i][j] += regM[i] * regN[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // 3.写回到C数组中
+    for (unsigned int i = 0; i < TM; ++i) {
+            for (unsigned int j = 0; j < TN; ++j) {
+                C[(blockIdx.y * BM + threadRow * TM + i) * N + blockIdx.x * BN + threadCol * TN + j] = acc[i][j];
+            } 
+    }
+
+}
+
 
 // 跑一次并和 cuBLAS 的结果对比，然后计时。launch 是一个"启动 kernel"的 lambda
 template <typename F>
@@ -128,6 +222,15 @@ int main(int argc, char** argv)
     dim3 block3(TILE, TILE), grid3((N + TILE - 1) / TILE, (N + TILE - 1) / TILE);
     run("K3", [&]() { sgemm_smem<<<grid3, block3>>>(d_A, d_B, d_C, N); },
         d_C, h_C, h_ref, N, gf_ref);
+    
+    if (N % BM == 0 && N % BN == 0 && N % BK == 0) {
+        dim3 block4(BM * BN / TM);      // 一维线程块：64 × 64 ÷ 8 = 512 个线程
+        dim3 grid4(N / BN, N / BM);     // x 方向有几个列块，y 方向有几个行块
+        run("K4", [&]() { sgemm_1D_tileing<<<grid4, block4>>>(d_A, d_B, d_C, N); },
+            d_C, h_C, h_ref, N, gf_ref);
+    } else {
+        printf("K4       跳过：N 必须是 64 的倍数\n");
+    }
 
     CUBLAS_CHECK(cublasDestroy(handle));
     CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B));

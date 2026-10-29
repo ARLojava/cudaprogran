@@ -1,10 +1,14 @@
 # SGEMM 优化（RTX 3090，N = 4096，FP32）
 
-| 版本 | 改了什么 | GFLOPS | 达到 cuBLAS | 瓶颈 |
-|---|---|---|---|---|
-| cuBLAS | 基线 | 24512 | 100% | — |
-| K2 | 合并访存 | 2291 | 9.3% | 每次乘加都要从显存读 2 个数 |
-| K3 | shared memory 分块 | 3053 | 12.5% | 每次乘加都要从 shared memory 读 2 个数 |
+| Kernel | GFLOPS | % of cuBLAS | 关键改动 |
+|---|---|---|---|
+| cuBLAS | 25307 | 100% | 基线 |
+| K2 naive | 2269 | 9.0% | |
+| K3 shared memory | 3037 | 12.0% | 分块 |
+| K4 1D blocktiling | 8757 | 34.6% | 每线程算 8 个结果 |
+| K5 2D blocktiling | 17401 | 68.8% | 每线程算 8×8 外积；stride 用编译期常量 |
+| K6 vectorized | 18832 | 74.4% | float4 读显存，As 转置 |
+
 
 ## 备忘录
 
