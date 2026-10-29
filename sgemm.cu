@@ -7,6 +7,14 @@
 #define BN 64
 #define BM 64
 #define TM 8
+#define TN 8
+#define BM5 128
+#define BN5 128
+#define BK5 8
+#define TM5 8
+#define TN5 8
+#define NT5 (BM5 * BN5 / (TM5 * TN5))     // 每块线程数 = 256
+static_assert(NT5 % BK5 == 0 && NT5 % BN5 == 0, "搬运时每趟要正好搬完整的行");
 static_assert(BK == BN / TM && BK == BM / TM, "K4 要求每个线程正好搬 As、Bs 各一格");
 
 #define CUBLAS_CHECK(call) do {                                         \
@@ -82,6 +90,109 @@ __global__ void sgemm_1D_tileing(const float* A, const float* B, float * C, int 
         C[(blockIdx.y * BM + threadRow * TM + index) * N + blockIdx.x * BN + threadCol] = acc[index];
     }
 }
+
+__global__ void sgemm_2D_tileing(const float* A, const float* B, float* C, int N)
+{
+    int tid = threadIdx.x;
+    int threadRow = tid / (BN5 / TN5);
+    int threadCol = tid % (BN5 / TN5);
+    float acc[TM5][TN5] = {0.0f};
+    __shared__ float As[BM5][BK5];  // 肥
+    __shared__ float Bs[BK5][BN5];  // 高
+
+    unsigned int strideA = NT5 / BK5;
+    unsigned int strideB = NT5 / BN5;
+    // 1,搬运至As中
+    for (unsigned int bk = 0; bk < N; bk += BK5) {
+        for (unsigned int offset = 0; offset < BM5; offset += strideA) {
+            As[tid / BK5 + offset][tid % BK5] = A[(blockIdx.y * BM5 + tid / BK5 + offset) * N + tid % BK5 + bk];
+        }
+
+        for (unsigned int offset = 0; offset < BK5; offset += strideB) {
+            Bs[tid / BN5 + offset][tid % BN5] = B[(tid / BN5 + bk + offset) * N + blockIdx.x * BN5 + tid % BN5];
+        }
+        __syncthreads();
+
+        //2.在dotIdx的前提下，取一列As与一行Bs放入寄存器中进行计算
+        for (unsigned int dotIdx = 0; dotIdx < BK5; ++dotIdx) {
+            float regM[TM5], regN[TN5];
+            for (unsigned int num = 0; num < TM5; ++num) {
+                // 为什么要乘TM5 ?
+                regM[num] = As[threadRow * TM5 + num][dotIdx];
+            }
+
+            for (unsigned int num = 0; num < TN5; ++num) {
+                // 为什么要乘TN5 ?
+                regN[num] = Bs[dotIdx][threadCol * TN5 + num];
+            }
+
+            for (unsigned int i = 0; i < TM5; ++i) {
+                for (unsigned int j = 0; j < TN5; ++j) {
+                    acc[i][j] += regM[i] * regN[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // 3.写回到C数组中
+    for (unsigned int i = 0; i < TM5; ++i) {
+            for (unsigned int j = 0; j < TN5; ++j) {
+                C[(blockIdx.y * BM5 + threadRow * TM5 + i) * N + blockIdx.x * BN5 + threadCol * TN5 + j] = acc[i][j];
+            } 
+    }
+
+}
+
+__global__ void sgemm_vectorize(const float* A, const float* B, float* C, int N)
+{
+    int tid = threadIdx.x;
+    int threadRow = tid / (BN5 / TN5);
+    int threadCol = tid % (BN5 / TN5);
+    float acc[TM5][TN5] = {0.0f};
+    __shared__ float As[BK5][BN5];  
+    __shared__ float Bs[BK5][BN5];  
+    const int threadsPerRowA = BK5 / 4;   
+    const int threadsPerRowB = BN5 / 4; 
+    
+    // 1,搬运至As中:向量读取 + 存入转置
+    for (unsigned int bk = 0; bk < N; bk += BK5) {
+        float4 temp = reinterpret_cast<const float4*>(&A[(blockIdx.y * BM5 + tid / threadsPerRowA) * N + bk + 4 * (tid % threadsPerRowA)])[0];
+        As[4 * (tid % threadsPerRowA)][tid / threadsPerRowA] = temp.x;
+        As[4 * (tid % threadsPerRowA) + 1][tid / threadsPerRowA] = temp.y;
+        As[4 * (tid % threadsPerRowA) + 2][tid / threadsPerRowA] = temp.z;
+        As[4 * (tid % threadsPerRowA) + 3][tid / threadsPerRowA] = temp.w;
+        float4 btemp = reinterpret_cast<const float4*>(&B[(tid / threadsPerRowB + bk) * N + 4 * (tid % threadsPerRowB) + blockIdx.x * BN5])[0];
+        reinterpret_cast<float4 *>(&Bs[tid / threadsPerRowB][4 * (tid % threadsPerRowB)])[0] = btemp;
+        __syncthreads();
+
+        //2.在dotIdx的前提下，取一列As与一行Bs放入寄存器中进行计算
+        for (unsigned int dotIdx = 0; dotIdx < BK5; ++dotIdx) {
+            float regM[TM5], regN[TN5];
+            for (unsigned int num = 0; num < TM5; ++num) {
+                regM[num] = As[dotIdx][threadRow * TM5 + num];
+            }
+
+            for (unsigned int num = 0; num < TN5; ++num) {
+                regN[num] = Bs[dotIdx][threadCol * TN5 + num];
+            }
+
+            for (unsigned int i = 0; i < TM5; ++i) {
+                for (unsigned int j = 0; j < TN5; ++j) {
+                    acc[i][j] += regM[i] * regN[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    // 3.写回到C数组中
+    for (unsigned int i = 0; i < TM5; ++i) {
+            for (unsigned int j = 0; j < TN5; ++j) {
+                C[(blockIdx.y * BM5 + threadRow * TM5 + i) * N + blockIdx.x * BN5 + threadCol * TN5 + j] = acc[i][j];
+            } 
+    }
+
+} 
+
 
 // 跑一次并和 cuBLAS 的结果对比，然后计时。launch 是一个"启动 kernel"的 lambda
 template <typename F>
@@ -169,6 +280,20 @@ int main(int argc, char** argv)
             d_C, h_C, h_ref, N, gf_ref);
     } else {
         printf("K4       跳过：N 必须是 64 的倍数\n");
+    }
+
+    if (N % BM5 == 0 && N % BN5 == 0 && N % BK5 == 0) {
+        dim3 block5(NT5);
+        dim3 grid5(N / BN5, N / BM5);
+        run("K5", [&]() { sgemm_2D_tileing<<<grid5, block5>>>(d_A, d_B, d_C, N); },
+            d_C, h_C, h_ref, N, gf_ref);
+    }
+
+    if (N % BM5 == 0 && N % BN5 == 0 && N % BK5 == 0) {
+    dim3 block6(NT5);
+    dim3 grid6(N / BN5, N / BM5);
+    run("K6", [&]() { sgemm_vectorize<<<grid6, block6>>>(d_A, d_B, d_C, N); },
+        d_C, h_C, h_ref, N, gf_ref);
     }
 
     CUBLAS_CHECK(cublasDestroy(handle));
